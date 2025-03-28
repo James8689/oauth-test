@@ -772,7 +772,7 @@ fastify.get('/api/extract-emails', async (request, reply) => {
           // Process one user at a time to prevent OpenAI API rate limiting
           console.log(`Processing emails for ${userEmail}...`);
           try {
-            const result = await emailProcessor.processEmailsToCSV(
+            const result = await emailProcessor.processThreadsToCSV(
               userEmail, 
               accessToken, 
               request.query.maxResults || 50,
@@ -833,7 +833,7 @@ fastify.get('/api/extract-user-emails/:email', async (request, reply) => {
     }
     
     // Process the user's emails using the imported function
-    const result = await emailProcessor.processEmailsToCSV(
+    const result = await emailProcessor.processThreadsToCSV(
       userEmail, 
       accessToken, 
       request.query.maxResults || 10, // Updated default to 50
@@ -850,6 +850,58 @@ fastify.get('/api/extract-user-emails/:email', async (request, reply) => {
     return reply.status(500).send({
       status: 'error',
       message: `Failed to process emails for ${userEmail}`,
+      error: error.message
+    });
+  }
+});
+
+// Add route to process sent emails
+fastify.get('/test-sent', async function (request, reply) {
+  const userEmail = request.cookies.userEmail;
+
+  if (!userEmail) {
+    return reply.redirect('/');
+  }
+
+  const tokenFile = path.join(DATA_DIR, `${userEmail}.json`);
+
+  if (!fs.existsSync(tokenFile)) {
+    return reply.redirect('/');
+  }
+
+  try {
+    const userData = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
+    let accessToken = userData.token.access_token;
+
+    // Check if token is expired
+    const isTokenExpired = userData.token.expires_at && new Date(userData.token.expires_at) < new Date();
+
+    if (isTokenExpired && userData.token.refresh_token) {
+      const refreshResult = await this.googleOAuth2.getNewAccessTokenUsingRefreshToken(userData.token);
+      userData.token = refreshResult.token;
+      accessToken = refreshResult.token.access_token;
+      fs.writeFileSync(tokenFile, JSON.stringify(userData, null, 2));
+    }
+
+    // Call processThreadsToCSV with the 'SENT' label
+    const result = await emailProcessor.processThreadsToCSV(
+      userEmail,
+      accessToken,
+      10, // Fetch top 10 threads
+      ['SENT'] // Specify the Sent folder
+    );
+
+    reply.send({
+      status: 'success',
+      message: `Processed ${result.messageCount} messages from ${result.threadCount} threads in your Sent folder`,
+      csvPath: result.csvFilePath,
+      jsonPath: result.jsonFilePath
+    });
+  } catch (error) {
+    console.error('Error fetching sent emails:', error);
+    reply.status(500).send({
+      status: 'error',
+      message: 'Failed to process sent emails',
       error: error.message
     });
   }

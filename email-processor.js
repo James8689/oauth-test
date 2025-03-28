@@ -74,24 +74,27 @@ function convertHTMLToText(html) {
  */
 function filterBoilerplateLines(text) {
   const footerKeywords = [
-    'unsubscribe', 'privacy policy', 'terms and conditions', 'contact us',
+    'unsubscribe', 'privacy policy', 'terms and conditions',
     'view in browser', 'sent from my', 'this email was sent by', 'copyright',
     'all rights reserved'
   ];
+  
   return text
     .split('\n')
     .map(line => line.trim())
     .filter(line => {
       if (line.length < 5) return false; // Skip very short lines
+      // Skip lines with footer keywords only
       const lowerLine = line.toLowerCase();
-      if (footerKeywords.some(keyword => lowerLine.includes(keyword))) return false;
-      if (/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b/i.test(line)) return false; // Email
-      if (/\b\d{3}-\d{3}-\d{4}\b/.test(line)) return false; // Phone number
-      if (/https?:\/\/[^\s]+/.test(line)) return false; // URL
+      if (footerKeywords.some(keyword => lowerLine.includes(keyword))) {
+        // Only filter if these are footer-like lines (short and only contain boilerplate)
+        // Preserve lines that have these keywords but are part of the main content
+        return line.length > 100 || !(/^[^a-zA-Z]*(\w+\s+){0,4}(unsubscribe|privacy|copyright)/).test(lowerLine);
+      }
+      // KEEP email addresses, phone numbers, and URLs - removing these filters
       return true;
     })
-    .join('\n')
-    .trim();
+    .join('\n');
 }
 
 /**
@@ -146,11 +149,10 @@ function enhancedCleanEmailContent(html) {
   // Filter out boilerplate lines
   text = filterBoilerplateLines(text);
 
-  // Remove tracking URLs and very long URLs
+  // Remove only tracking URLs, not all URLs
   text = text.replace(/https?:\/\/[^\s]+?(?:\?utm_[^\s]+|click[^\s]+|link\.[^\s]+)/g, '');
-  text = text.replace(/https?:\/\/[^\s]{50,}/g, '');
-
-  // Additional patterns to add
+  
+  // Keep most URLs, only remove tracking-specific ones
   text = text.replace(/https?:\/\/[^\/\s]+\/(track|click|open|view)[^\s]*/g, '');
   text = text.replace(/https?:\/\/[^\s]+\/(e|t)\/[a-zA-Z0-9]{5,}[^\s]*/g, '');
 
@@ -162,27 +164,25 @@ function enhancedCleanEmailContent(html) {
   // Normalize whitespace
   text = normalizeWhitespace(text);
 
-  // Add to your clean text function
+  // Additional whitespace cleanup
   text = text.replace(/[\u200B-\u200D\u2060\uFEFF\u00A0\u1680\u180E\u2000-\u200A\u202F\u205F\u3000]+/g, '');
   text = text.replace(/\n{3,}/g, '\n\n'); // Replace 3+ consecutive newlines with just 2
 
-  // Add to regex patterns
-  text = text.replace(/\d+\s+[A-Za-z\s]+,\s+[A-Za-z\s]+,\s+[A-Z]{2}\s+\d{5}(-\d{4})?/g, '');
-
-  // Detect duplicated content
+  // Detect duplicated content - but be more careful with this
   const halfLength = Math.floor(text.length / 2);
   if (halfLength > 100) {
     const firstHalf = text.substring(0, halfLength);
     const secondHalf = text.substring(halfLength);
-    if (secondHalf.includes(firstHalf.substring(0, 80))) {
+    // Only consider it duplicated if a significant chunk is repeated
+    if (secondHalf.includes(firstHalf.substring(0, 150))) {
       text = firstHalf;
     }
   }
 
-  // Truncate if too long (optional: adjust limit as needed)
-  if (text.length > 2000) {
-    text = text.substring(0, 2000) + '...';
-  }
+  // REMOVED: Truncation - no longer limiting text length
+  // if (text.length > 2000) {
+  //   text = text.substring(0, 2000) + '...';
+  // }
 
   // Warn if text is too short (possible overcleaning)
   if (text.length < 20) {
@@ -217,14 +217,9 @@ function cleanPlainText(text) {
     lines.splice(signatureStart);
   }
 
-  // Filter out lines with contact info or URLs
-  const cleanedLines = lines.filter(line => {
-    const trimmed = line.trim();
-    if (/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b/i.test(trimmed)) return false; // Email
-    if (/\b\d{3}-\d{3}-\d{4}\b/.test(trimmed)) return false; // Phone number
-    if (/https?:\/\/[^\s]+/.test(trimmed)) return false; // URL
-    return true;
-  });
+  // Keep all content lines including URLs, emails, and phone numbers
+  // Just filter out empty lines
+  const cleanedLines = lines.filter(line => line.trim().length > 0);
 
   return normalizeWhitespace(cleanedLines.join('\n'));
 }
@@ -286,14 +281,155 @@ function escapeCSVField(field) {
 }
 
 /**
+ * Organize emails by thread, sorting them chronologically.
+ * @param {Array} emails - Array of processed email objects.
+ * @returns {Object} Object with threadIds as keys and arrays of sorted emails as values.
+ */
+function organizeEmailsByThread(emails) {
+  const threads = {};
+
+  emails.forEach(email => {
+    if (!threads[email.threadId]) {
+      threads[email.threadId] = [];
+    }
+    threads[email.threadId].push(email);
+  });
+
+  // Sort emails within each thread by date (oldest first)
+  Object.values(threads).forEach(threadEmails => {
+    threadEmails.sort((a, b) => new Date(a.date) - new Date(b.date));
+  });
+
+  return threads;
+}
+
+/**
+ * Fetch complete email threads from Gmail and process them.
+ * @param {string} userEmail - The user's email address.
+ * @param {string} accessToken - OAuth token for Gmail API.
+ * @param {number} [maxResults=50] - Max number of threads to fetch.
+ * @param {string[]} [labelIds=['SENT']] - Gmail labels to query.
+ * @returns {Promise<object>} Result of the processing.
+ */
+async function processThreadsToCSV(userEmail, accessToken, maxResults = 50, labelIds = ['SENT']) {
+  // Convert labelIds to array if it's a string
+  if (!Array.isArray(labelIds)) {
+    labelIds = [labelIds];
+  }
+
+  console.log(`Processing email threads for ${userEmail} from labels: ${labelIds.join(', ')}`);
+
+  try {
+    // 1. Fetch the list of threads
+    const labelQuery = labelIds.map(label => `labelIds=${encodeURIComponent(label)}`).join('&');
+    const threadsResponse = await fetch(
+      `https://www.googleapis.com/gmail/v1/users/me/threads?maxResults=${maxResults}&${labelQuery}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    if (!threadsResponse.ok) {
+      throw new Error(`Gmail API error: ${threadsResponse.statusText}`);
+    }
+
+    const threadsData = await threadsResponse.json();
+    if (!threadsData.threads || threadsData.threads.length === 0) {
+      console.log(`No threads found for ${userEmail}`);
+      return { success: true, count: 0 };
+    }
+
+    console.log(`Found ${threadsData.threads.length} threads for ${userEmail}`);
+
+    // 2. Fetch all messages in each thread
+    const threadPromises = threadsData.threads.map(thread =>
+      fetch(
+        `https://www.googleapis.com/gmail/v1/users/me/threads/${thread.id}?format=full`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      ).then(res => res.json())
+    );
+    const completeThreads = await Promise.all(threadPromises);
+
+    // 3. Process each thread's messages
+    const processedEmails = [];
+    let totalMessageCount = 0;
+
+    for (const thread of completeThreads) {
+      if (thread.messages && Array.isArray(thread.messages)) {
+        totalMessageCount += thread.messages.length;
+        for (const msg of thread.messages) {
+          const headers = {};
+          if (msg?.payload?.headers) {
+            msg.payload.headers.forEach(header => {
+              headers[header.name.toLowerCase()] = header.value;
+            });
+          }
+          const body = msg?.payload ? decodeEmailBody(msg.payload) : '';
+          processedEmails.push({
+            id: msg?.id || 'unknown',
+            threadId: thread.id || 'unknown',
+            date: headers.date || '',
+            from: headers.from || '',
+            to: headers.to || '',
+            subject: headers.subject || '',
+            body: body
+          });
+        }
+      }
+    }
+
+    // 4. Organize emails by thread and write to CSV
+    const threadedEmails = organizeEmailsByThread(processedEmails);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const csvFilePath = path.join(CSV_DIR, `${userEmail.replace('@', '_at_')}_threads_${timestamp}.csv`);
+    const csvHeader = 'Thread ID,Thread Position,Message ID,Date,From,To,Subject,Body\n';
+    fs.writeFileSync(csvFilePath, csvHeader, 'utf8');
+
+    let csvData = '';
+    for (const [threadId, emails] of Object.entries(threadedEmails)) {
+      emails.forEach((email, index) => {
+        const csvRow = [
+          escapeCSVField(threadId),
+          escapeCSVField(index + 1),
+          escapeCSVField(email.id),
+          escapeCSVField(email.date),
+          escapeCSVField(email.from),
+          escapeCSVField(email.to),
+          escapeCSVField(email.subject),
+          escapeCSVField(email.body)
+        ].join(',') + '\n';
+        csvData += csvRow;
+
+        if (csvData.length > 1000000) {
+          fs.appendFileSync(csvFilePath, csvData, 'utf8');
+          csvData = '';
+        }
+      });
+    }
+    if (csvData.length > 0) {
+      fs.appendFileSync(csvFilePath, csvData, 'utf8');
+    }
+
+    console.log(`Thread-based CSV created at: ${csvFilePath}`);
+    return {
+      success: true,
+      threadCount: Object.keys(threadedEmails).length,
+      messageCount: totalMessageCount,
+      csvFilePath
+    };
+  } catch (error) {
+    console.error(`Error processing email threads for ${userEmail}:`, error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
  * Fetch emails from Gmail, clean their content, and write to a CSV file.
  * @param {string} userEmail - The user's email address.
  * @param {string} accessToken - OAuth token for Gmail API.
  * @param {number} [maxResults=50] - Max number of messages to fetch.
- * @param {string[]} [labelIds=['INBOX']] - Gmail labels to query.
+ * @param {string[]} [labelIds=['SENT']] - Gmail labels to query.
  * @returns {Promise<object>} Result of the processing.
  */
-async function processEmailsToCSV(userEmail, accessToken, maxResults = 50, labelIds = ['INBOX']) {
+async function processEmailsToCSV(userEmail, accessToken, maxResults = 50, labelIds = ['SENT']) {
   console.log(`Processing emails for ${userEmail} from labels: ${labelIds.join(', ')}`);
 
   try {
@@ -388,6 +524,7 @@ async function processEmailsToCSV(userEmail, accessToken, maxResults = 50, label
 // Export functions for use in other modules
 module.exports = {
   processEmailsToCSV,
+  processThreadsToCSV,
   decodeEmailBody,
   escapeCSVField,
   enhancedCleanEmailContent
