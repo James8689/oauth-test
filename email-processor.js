@@ -179,10 +179,6 @@ function enhancedCleanEmailContent(html) {
     }
   }
 
-  // REMOVED: Truncation - no longer limiting text length
-  // if (text.length > 2000) {
-  //   text = text.substring(0, 2000) + '...';
-  // }
 
   // Warn if text is too short (possible overcleaning)
   if (text.length < 20) {
